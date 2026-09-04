@@ -39,6 +39,24 @@
  * package topology to the BMC regardless of which chip answers.) */
 #define NCSI_MAX_CHANNELS 1
 
+/* One Set MAC Address filter slot (DSP0222 clause 8.4.34). Tracked locally
+ * in addition to whatever Network_SetMACAddr() does in your MAC driver, so
+ * the Pass-through BMC-to-network direction (clause 6.1.11) can check "does
+ * this frame's source MAC match a configured unicast filter" without a
+ * round trip through the driver -- see ncsi_passthrough_tx_from_mc() in
+ * ncsi.c. */
+typedef struct
+{
+    bool enabled;
+    uint8_t address_type; /* AT field, Table 68: 0 = unicast, 1 = multicast */
+    uint8_t mac[6];        /* wire order, MSB (mac[0]) first */
+} ncsi_mac_filter_t;
+
+/* DSP0222 does not fix a filter-count ceiling; this is a local sizing limit
+ * for ncsi_channel_state_t::mac_filters. Get Capabilities' UnicastFilterCount
+ * (gCapabilitiesFrame in ncsi.c) must not claim more slots than this. */
+#define NCSI_MAX_MAC_FILTERS 8
+
 /* --- Per-channel NC-SI state -------------------------------------------
  * Upstream (bcm5719-fw) keeps this in APE<->main-chip shared memory
  * (port->shm_channel->NcsiChannelInfo.bits.*, etc.) because the APE
@@ -59,6 +77,9 @@ typedef struct
 
     uint32_t link_settings;      /* Set Link command's LinkSettings (NcsiChannelSetting1) */
     uint32_t oem_link_settings;  /* Set Link command's OEMLinkSettings (NcsiChannelSetting2) */
+
+    uint32_t broadcast_filter_settings; /* Enable/Disable Broadcast Filter's BroadcastPacketFilterSettings bitmask; 0 = no broadcast filtering (all broadcast passed) */
+    ncsi_mac_filter_t mac_filters[NCSI_MAX_MAC_FILTERS]; /* Set MAC Address's configured filter slots -- see ncsi_mac_filter_t above */
 
     /* Cached NC-SI Get Link Status response fields (NcsiChannelStatus).
      * NOTE: verify these bit meanings against DSP0222 Get Link Status

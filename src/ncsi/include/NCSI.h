@@ -83,11 +83,31 @@ void NCSI_TxBePacket(const uint8_t* packet, uint32_t packet_len);
 
 void NCSI_handlePassthrough(void);
 
+/* BMC-to-network Pass-through (DSP0222 clause 6.1.11): call this from your
+ * RX path (see ncsi_hal_template.c's ncsi_on_rx_frame()) for any received
+ * frame that is NOT an NC-SI control frame (EtherType != 0x88F8) -- pass
+ * the frame's 6-byte source MAC and the raw frame/length. Returns true if
+ * it was forwarded to the external network (Channel Network TX enabled AND
+ * the source MAC matches a configured, enabled unicast Set MAC Address
+ * filter); false if it was silently dropped (either condition not met --
+ * per spec, Pass-through packets never get an NC-SI response either way,
+ * so "dropped" here just means "not forwarded", not an error condition). */
+bool ncsi_passthrough_tx_from_mc(NetworkPort_t *port, const uint8_t source_mac[6], const uint8_t *frame, uint32_t frame_len);
+
 void NCSI_init(void);
 
 void NCSI_reload(reload_type_t reset_phy);
 
 //lint -sem(NCSI_usePort, 1p) Warn if port is NULL
 void NCSI_usePort(NetworkPort_t *port);
+
+/* Whether outgoing responses get a real DSP0222 Checksum computed instead
+ * of the default 0/0 ("not calculated", always spec-valid) sentinel. New
+ * for this port (not from bcm5719-fw, which never computes one). Boots to
+ * NCSI_COMPUTE_CHECKSUM_DEFAULT (ncsi_board_config.h, default false); these
+ * let you flip it at runtime too. See ncsi_compute_checksum() in types.h
+ * for exactly what's verified about the algorithm and what isn't. */
+void NCSI_SetComputeChecksum(bool enable);
+bool NCSI_GetComputeChecksum(void);
 
 #endif /* NCSI_H */

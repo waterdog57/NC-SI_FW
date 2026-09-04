@@ -93,7 +93,8 @@ void Network_SetMACAddr(NetworkPort_t *port, uint16_t h, uint32_t l, uint32_t id
     gLastMacEnable = en;
     gSetMacCalled = true;
 }
-bool Network_PassthroughRxPacket(NetworkPort_t *port) { (void)port; return true; }
+static uint32_t gPassthroughRxCalls;
+bool Network_PassthroughRxPacket(NetworkPort_t *port) { (void)port; gPassthroughRxCalls++; return true; }
 
 bool Network_TxFrame(NetworkPort_t *port, const uint8_t *frame, uint32_t frame_len)
 {
@@ -165,6 +166,44 @@ static void send(const uint8_t *pkt, uint32_t len, const char *name, uint16_t ex
 
     printf("PASS [%s] tx_len=%u response_code=0x%04x reason_code=0x%04x\n",
            name, gTxLen, resp_response_code, resp_reason_code);
+}
+
+/* DSP0222 clause 8.2.2.3's own verification recipe, quoted verbatim from
+ * the spec text (not paraphrased): "A packet receiver supporting packet
+ * checksum verification shall use the checksum compensation value to
+ * verify packet data integrity by computing the 32-bit checksum described
+ * above [the 16-bit-word sum, over the region *excluding* the checksum
+ * field itself], adding to it the checksum compensation value from the
+ * packet [as a single 32-bit value -- NOT re-split into two more 16-bit
+ * words], and verifying that the result is 0."
+ *
+ * This is deliberately NOT "sum the whole region, checksum bytes included,
+ * as uniform 16-bit (or 32-bit) words" -- that natural-looking simplification
+ * does not actually reduce to zero for this algorithm, because the checksum
+ * field's 4 bytes are a single 32-bit quantity (weighted by 65536 for its
+ * high 16 bits), not two more unweighted 16-bit terms in the same sum. Get
+ * that distinction wrong here and this self-check would fail even for a
+ * correctly-computed checksum -- worth spelling out since it is easy to
+ * get backwards.
+ *
+ * Independent of ncsi_compute_checksum() (types.h) on purpose (re-sums by
+ * hand rather than calling it), so this test doesn't just re-run the same
+ * code it's meant to verify. */
+static uint32_t verify_checksum(const uint8_t *buf, uint32_t region_start, uint32_t region_len, uint32_t checksum_offset)
+{
+    uint32_t end = region_start + region_len;
+    uint32_t sum = 0;
+    uint32_t i;
+    for (i = region_start; i + 2 <= end; i += 2)
+    {
+        sum += ncsi_rd16(&buf[i]);
+    }
+    if (i < end)
+    {
+        sum += (uint32_t)buf[i] << 8;
+    }
+    sum += ncsi_rd32(&buf[checksum_offset]);
+    return sum;
 }
 
 int main(void)
@@ -284,6 +323,148 @@ int main(void)
         garbage_cmd[18] = 0x30;
         send(garbage_cmd, select_package1_len, "Garbage command (0x30)", NCSI_RESPONSE_CODE_COMMAND_UNSUPPORTED);
     }
+
+    /* --- Checksum feature: default off, self-consistent when on -------
+     * Only what's actually verifiable without a real DSP0222 spec copy or
+     * a real captured checksummed frame: (a) the default really is off and
+     * responses keep the 0/0 "not calculated" sentinel until asked
+     * otherwise, (b) once enabled, the computed checksum is internally
+     * self-consistent -- summing the whole checksummed region *including*
+     * the checksum bytes that were just written should total zero, the
+     * standard checksum self-check. This does NOT confirm the algorithm
+     * matches DSP0222's; see ncsi_compute_checksum()'s comment in types.h. */
+    gTestPackageId = 0;
+    gTestChannelId = 0;
+    NCSI_init();
+
+    CHECK(!NCSI_GetComputeChecksum(), "Checksum defaults to off");
+
+    send(select_package1, select_package1_len, "Select Package (checksum off)", NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
+    {
+        const NetworkFrame_t *resp = (const NetworkFrame_t *)gTxBuf;
+        CHECK(ncsi_rd32(resp->responsePacket.checksum) == 0,
+              "Checksum off -> response keeps 0/0 sentinel");
+    }
+
+    NCSI_SetComputeChecksum(true);
+
+    /* Get Link Status / Get Capabilities / Get Version ID below are
+     * channel-specific commands -- need Clear Initial State first (the
+     * NCSI_init() above reset ready back to false), or they'd correctly
+     * fail with INITIALIZATION_REQUIRED instead of exercising the checksum
+     * path this block is actually testing. */
+    send(clear_initial_state, clear_initial_state_len, "Clear Initial State (checksum on)", NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
+
+    /* Checked across all four response struct types, not just
+     * ResponsePacketHeader_t -- the checksummed region length (and so the
+     * number of 16-bit words summed) differs in each (see Ethernet.h), so
+     * each is a genuinely separate check of ncsi_compute_checksum(), not a
+     * repeat of the same one. */
+    send(select_package1, select_package1_len, "Select Package (checksum on)", NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
+    CHECK(verify_checksum(gTxBuf, offsetof(ResponsePacketHeader_t, ManagmentControllerID),
+                           offsetof(ResponsePacketHeader_t, checksum) - offsetof(ResponsePacketHeader_t, ManagmentControllerID),
+                           offsetof(ResponsePacketHeader_t, checksum)) == 0,
+          "Checksum self-consistent: ResponsePacketHeader_t");
+
+    send(get_link_status_ch0, get_link_status_ch0_len, "Get Link Status (checksum on)", NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
+    CHECK(verify_checksum(gTxBuf, offsetof(LinkStatusResponsePacketHeader_t, ManagmentControllerID),
+                           offsetof(LinkStatusResponsePacketHeader_t, checksum) - offsetof(LinkStatusResponsePacketHeader_t, ManagmentControllerID),
+                           offsetof(LinkStatusResponsePacketHeader_t, checksum)) == 0,
+          "Checksum self-consistent: LinkStatusResponsePacketHeader_t");
+
+    send(get_capabilities, get_capabilities_len, "Get Capabilities (checksum on)", NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
+    CHECK(verify_checksum(gTxBuf, offsetof(CapabilitiesResponsePacket_t, ManagmentControllerID),
+                           offsetof(CapabilitiesResponsePacket_t, checksum) - offsetof(CapabilitiesResponsePacket_t, ManagmentControllerID),
+                           offsetof(CapabilitiesResponsePacket_t, checksum)) == 0,
+          "Checksum self-consistent: CapabilitiesResponsePacket_t");
+
+    send(get_version_id, get_version_id_len, "Get Version ID (checksum on)", NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
+    CHECK(verify_checksum(gTxBuf, offsetof(VersionResponsePacket_t, ManagmentControllerID),
+                           offsetof(VersionResponsePacket_t, checksum) - offsetof(VersionResponsePacket_t, ManagmentControllerID),
+                           offsetof(VersionResponsePacket_t, checksum)) == 0,
+          "Checksum self-consistent: VersionResponsePacket_t");
+
+    printf("PASS [Checksum self-consistency] all 4 response struct types verified\n");
+    NCSI_SetComputeChecksum(false); /* leave the flag as we found it */
+
+    /* --- Pass-through (DSP0222 clauses 6.1.11 / 6.1.12) -------------------
+     * Two independent directions, each checked in isolation from the NC-SI
+     * control-packet dispatch tested above. */
+    printf("\n-- Pass-through tests --\n");
+    gTestPackageId = 0;
+    gTestChannelId = 0;
+    NCSI_init();
+
+    /* BMC-to-network (clause 6.1.11): a non-control frame is forwarded only
+     * if Channel Network TX is enabled (Enable Channel Network TX command)
+     * AND the frame's source MAC matches a configured, enabled *unicast*
+     * Set MAC Address filter -- check every gating combination indepen-
+     * dently, since getting any one of them backwards would either leak
+     * traffic that should be blocked or silently drop traffic that should
+     * pass. */
+    {
+        const uint8_t src_mac[6] = {0x2c, 0x09, 0x4d, 0x00, 0x01, 0x4a};
+        const uint8_t other_mac[6] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+        uint8_t frame[64];
+        memset(frame, 0, sizeof(frame));
+        memcpy(&frame[6], src_mac, 6);   /* Ethernet source MAC field */
+        frame[12] = 0x08;                /* EtherType 0x0800 (IPv4) -- anything that isn't 0x88F8 */
+        frame[13] = 0x00;
+
+        bool fwd;
+
+        gTxCalled = false;
+        fwd = ncsi_passthrough_tx_from_mc(&port, src_mac, frame, sizeof(frame));
+        CHECK(!fwd && !gTxCalled, "Passthrough BMC->net: TX disabled, no filter -> not forwarded");
+
+        port.state.tx_passthrough_en = true;
+        gTxCalled = false;
+        fwd = ncsi_passthrough_tx_from_mc(&port, src_mac, frame, sizeof(frame));
+        CHECK(!fwd && !gTxCalled, "Passthrough BMC->net: TX enabled, no matching filter -> not forwarded");
+
+        port.state.mac_filters[0].enabled = true;
+        port.state.mac_filters[0].address_type = 0; /* unicast (Table 68) */
+        memcpy(port.state.mac_filters[0].mac, src_mac, 6);
+
+        gTxCalled = false;
+        fwd = ncsi_passthrough_tx_from_mc(&port, src_mac, frame, sizeof(frame));
+        CHECK(fwd && gTxCalled && gTxLen == sizeof(frame), "Passthrough BMC->net: TX enabled + matching unicast filter -> forwarded");
+
+        gTxCalled = false;
+        fwd = ncsi_passthrough_tx_from_mc(&port, other_mac, frame, sizeof(frame));
+        CHECK(!fwd && !gTxCalled, "Passthrough BMC->net: non-matching source MAC -> not forwarded");
+
+        port.state.mac_filters[0].address_type = 1; /* multicast -- must NOT satisfy the unicast-only check */
+        gTxCalled = false;
+        fwd = ncsi_passthrough_tx_from_mc(&port, src_mac, frame, sizeof(frame));
+        CHECK(!fwd && !gTxCalled, "Passthrough BMC->net: filter is multicast, not unicast -> not forwarded");
+
+        port.state.mac_filters[0].address_type = 0;
+        port.state.mac_filters[0].enabled = false;
+        gTxCalled = false;
+        fwd = ncsi_passthrough_tx_from_mc(&port, src_mac, frame, sizeof(frame));
+        CHECK(!fwd && !gTxCalled, "Passthrough BMC->net: filter disabled -> not forwarded");
+
+        port.state.tx_passthrough_en = false; /* leave state as found */
+    }
+
+    /* Network-to-BMC (clause 6.1.12): "after the channel has been enabled"
+     * -- NCSI_handlePassthrough() must poll Network_PassthroughRxPacket()
+     * only once Enable Channel has been received (state.enabled), not
+     * merely once Clear Initial State has (state.ready) -- those are
+     * different DSP0222 states, and this was a real bug (gated on `ready`)
+     * before this Pass-through pass fixed it. */
+    {
+        gPassthroughRxCalls = 0;
+        port.state.enabled = false;
+        NCSI_handlePassthrough();
+        CHECK(gPassthroughRxCalls == 0, "Passthrough net->BMC: channel not enabled -> not polled");
+
+        port.state.enabled = true;
+        NCSI_handlePassthrough();
+        CHECK(gPassthroughRxCalls == 1, "Passthrough net->BMC: channel enabled -> polled");
+    }
+    printf("PASS [Pass-through] both directions verified\n");
 
     if (failures)
     {

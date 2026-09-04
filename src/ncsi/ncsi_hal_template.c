@@ -191,10 +191,19 @@ void ncsi_on_rx_frame(const uint8_t *frame, uint32_t frame_len)
     if (ncsi_rd16(ncsi_frame->header.EtherType) == ETHER_TYPE_NCSI)
     {
         handleNCSIFrame(ncsi_frame);
+        return;
     }
-    /* else: not an NC-SI control frame -- your normal RX path handles it
-     * (or, if tx_passthrough_en is set for this channel, it's the kind of
-     * frame Network_PassthroughRxPacket() is expected to forward). */
+
+    /* Not an NC-SI control frame -- DSP0222 clause 6.1.11 (Pass-through,
+     * BMC-to-network direction): "Packets not recognized as command
+     * packets ... shall be assumed to be Pass-through packets provided
+     * that the source MAC Address matches one of the unicast MAC addresses
+     * settings ..., and will be forwarded for transmission to the
+     * corresponding external network interface if Channel Network TX is
+     * enabled." ncsi_passthrough_tx_from_mc() (ncsi.c) checks both
+     * conditions and does the forwarding; it silently declines (no NC-SI
+     * response either way for Pass-through packets) if either isn't met. */
+    ncsi_passthrough_tx_from_mc(&gPorts[0], ncsi_frame->header.SourceAddress, frame, frame_len);
 }
 
 /* --- RX OK interrupt / DMA descriptor -----------------------------------

@@ -84,8 +84,9 @@ a placeholder default):
 |---|---|---|
 | `NCSI_PACKAGE_CHANNEL_COUNT` | `2` | Total channels in this **package** (both ICs combined) — leave at 2 for this board |
 | `NCSI_FW_VERSION_MAJOR/MINOR/PATCH` | `0/1/0` | Your firmware's own version, reported in Get Version ID |
-| `NCSI_MANUFACTURER_ID` | `0` | Your real DMTF/IANA Enterprise Number — 0 isn't valid, **must** be changed before shipping |
-| `NCSI_PCI_VENDOR_ID` / `_DEVICE_ID` / `_SUBSYSTEM_VENDOR_ID` / `_SUBSYSTEM_DEVICE_ID` | `0xFFFF` | DSP0222's "not applicable" sentinel — only set real values if this device has actual PCI config space to report |
+| `NCSI_MANUFACTURER_ID` | `0xFFFFFFFF` | Your real DMTF/IANA Enterprise Number — the default is DSP0222's own "unused" sentinel (clause 8.4.44.5); set a real PEN before shipping if you have one |
+| `NCSI_PCI_VENDOR_ID` / `_DEVICE_ID` / `_SUBSYSTEM_VENDOR_ID` / `_SUBSYSTEM_DEVICE_ID` | `0x0000` | DSP0222's "not used" sentinel (clause 8.4.44.4) — only set real values if this device has actual PCI config space to report. Note this sentinel is `0x0000`, not `0xFFFFFFFF` like Manufacturer ID above — the two fields don't share one "unused" convention |
+| `NCSI_COMPUTE_CHECKSUM_DEFAULT` | `false` | Whether responses get a real DSP0222 Checksum computed instead of the 0/0 "not calculated" sentinel — see "Optional: DSP0222 Checksum computation" below before enabling |
 
 Any of these can also be overridden at build time instead of editing the
 header, e.g. `-DNCSI_MANUFACTURER_ID=0x12345678`.
@@ -104,7 +105,7 @@ version:
 | `Network_SetMACAddr` | program a MAC address filter slot (called from Set MAC Address) |
 | `Network_TxFrame` | transmit an NC-SI response frame — see step 3, needs more than a TODO fill-in on this board |
 | `MII_getPhy` / `MII_readRegister` / `MII_reset` | MDIO access to the PHY (link-status polling and reset) |
-| `Network_PassthroughRxPacket` | forward a non-NC-SI frame toward the host network side, if your design needs that (Enable Channel Network TX support) |
+| `Network_PassthroughRxPacket` | forward one pending network-to-BMC Pass-through frame (clause 6.1.12) — called from `NCSI_handlePassthrough()`, which you poll; see "Pass-through" below |
 
 ### 3. TX: descriptor + polling bit
 
@@ -262,12 +263,12 @@ per DSP0222.
 | `0x08` | AEN Enable | Mandatory | Supported |
 | `0x09` | Set Link | Mandatory | Supported |
 | `0x0A` | Get Link Status | Mandatory | Supported |
-| `0x0B` | Set VLAN Filter | Conditional (VLAN) | Stub — accepted, no filtering applied |
-| `0x0C` | Enable VLAN | Conditional (VLAN) | Stub — accepted, no filtering applied |
-| `0x0D` | Disable VLAN | Conditional (VLAN) | Stub — accepted, no filtering applied |
-| `0x0E` | Set MAC Address | Mandatory | Supported |
-| `0x10` | Enable Broadcast Filtering | Mandatory | Stub — accepted, no filtering applied |
-| `0x11` | Disable Broadcast Filtering | Mandatory | Stub — accepted, no filtering applied |
+| `0x0B` | Set VLAN Filter | Conditional (VLAN) | Tracked, not enforced — value recorded, no traffic filtering applied |
+| `0x0C` | Enable VLAN | Conditional (VLAN) | Tracked, not enforced |
+| `0x0D` | Disable VLAN | Conditional (VLAN) | Tracked, not enforced |
+| `0x0E` | Set MAC Address | Mandatory | Supported — filter slots also tracked locally for Pass-through (see below) |
+| `0x10` | Enable Broadcast Filtering | Mandatory | Tracked, not enforced |
+| `0x11` | Disable Broadcast Filtering | Mandatory | Supported (clears the tracked filter) |
 | `0x12` | Enable Global Multicast Filtering | Optional | Not implemented |
 | `0x13` | Disable Global Multicast Filtering | Optional | Not implemented |
 | `0x14` | Set NC-SI Flow Control | Optional | Not implemented |
@@ -281,6 +282,46 @@ per DSP0222.
 
 `0x17` Get Parameters is the one gap in this table that's DSP0222-mandatory
 and genuinely missing — see "Known gaps" for why it wasn't attempted here.
+
+Pass-through (clauses 6.1.11/6.1.12) isn't a command in this table — it's
+automatic handling of *non*-control frames, triggered by Enable Channel
+Network TX (`0x06`) and Set MAC Address (`0x0E`) rather than being a
+command itself. See "Pass-through" below.
+
+## Pass-through
+
+DSP0222 clauses 6.1.11/6.1.12 define two independent directions for
+forwarding traffic that isn't an NC-SI control frame. Both are implemented.
+
+**BMC-to-network** (clause 6.1.11): a frame received on the NC-SI sideband
+interface that isn't a recognized NC-SI command packet is forwarded to the
+external network interface if **both** hold: Channel Network TX is enabled
+(`0x06` Enable Channel Network TX was received, tracked as
+`state.tx_passthrough_en`), and the frame's source MAC matches a
+configured, enabled **unicast** Set MAC Address filter (`0x0E`, tracked in
+`state.mac_filters[]` — see `Network.h`'s `ncsi_mac_filter_t`). Neither
+condition being met means the frame is silently dropped — per spec,
+Pass-through packets never get an NC-SI response either way, met or not.
+Implemented as `ncsi_passthrough_tx_from_mc()` (`ncsi.c`), called from
+`ncsi_on_rx_frame()`'s non-NC-SI branch in `ncsi_hal_template.c`.
+
+**Network-to-BMC** (clause 6.1.12): "after the channel has been enabled,
+any packet that the Network Controller receives for the Management
+Controller shall be forwarded to the Management Controller." Implemented as
+`NCSI_handlePassthrough()` (`ncsi.c`), which you should poll once per main
+loop iteration (or drive from an RX interrupt on the network side) — it
+calls your `Network_PassthroughRxPacket()` (`Network.h`) once the channel
+is enabled (`state.enabled`, set by `0x03` Enable Channel), and counts a
+`false` return in `state.stat_net_dropped`. This gate was previously (and
+incorrectly) checking `state.ready` — set by Clear Initial State, a
+different and earlier DSP0222 state than "enabled" — before this pass
+corrected it to match the clause's actual wording.
+
+Both directions are unit-tested in `tests/test_ncsi.c` (see "Pass-through
+tests" in its output): every gating combination for the BMC-to-network
+direction (TX disabled, no matching filter, non-matching source MAC,
+multicast-not-unicast filter, disabled filter, and the one case that should
+actually forward), and both states of the network-to-BMC enable gate.
 
 ## Bugs found and fixed during this port
 
@@ -365,10 +406,103 @@ existing `COMMAND_UNSUPPORTED` path for anything out of range — same
 behavior as any other unimplemented command, just no longer able to read
 out of bounds to get there. Regression test in `tests/test_ncsi.c`.
 
+### 4. Wire-format structs didn't actually match the real DSP0222 spec
+
+Everything above (bug #1's bit-field fix, the checksum feature's own first
+draft) was built and self-consistency-tested against a byte layout that had
+been *reverse-engineered* from upstream's inherited struct declarations and
+a handful of real captures — never checked against the actual DSP0222
+specification text, because it wasn't available yet. Once the real DSP0222
+v1.2.1 spec was obtained and `Ethernet.h` was cross-checked against its
+Table 10 (the NC-SI Control Packet header) and clause 8.4's per-command
+tables, three real bugs turned up, none of them caught by the earlier
+self-consistency tests (which only prove a layout is *internally*
+consistent, not that it matches the wire the real BMC expects):
+
+1. **The NC-SI header was 2 bytes short.** DSP0222's NC-SI Control Packet
+   header is 16 bytes (Table 10); the inherited layout's was 14 (6 bytes of
+   trailing `Reserved` instead of 8), so every payload field after it was
+   offset by 2 bytes from where DSP0222 actually puts it.
+2. **Response payloads had spurious 2-byte gaps.** `ResponseCode` and
+   `ReasonCode` are immediately adjacent in every DSP0222 response table
+   (bytes 16–19 as one 4-byte group); the inherited layout had an
+   undocumented 2-byte gap between them that doesn't appear in any DSP0222
+   table.
+3. **Checksum was split into two non-adjacent halves.** DSP0222 defines
+   Checksum (clause 8.2.2.3, and every per-command table) as **one
+   contiguous 4-byte field** placed right after the payload. The inherited
+   layout had `Checksum_High` sitting mid-payload and `Checksum_Low` near
+   the very end — not a shape any DSP0222 table describes, and the direct
+   cause of bug #4 in the original numbering of this section (a naive
+   high/low split of one computed value doesn't work when the two halves
+   aren't even adjacent).
+
+**Fix**: `Ethernet.h` was rewritten field-by-field directly against
+DSP0222 v1.2.1's tables rather than reverse-engineered further — every
+struct's comment now cites the specific table it was built from. Checksum
+is a single `checksum[4]` field in every struct now, and
+`ncsi_compute_checksum()` (`types.h`) was rewritten to match DSP0222's
+actual algorithm (see below) instead of the ad-hoc 32-bit-word/split-field
+version this port used before the spec text was available. `ncsi.c` was
+rebuilt against the corrected structs and re-verified (`tests/test_ncsi.c`,
+plain build and `-fsanitize=address,undefined`) — all commands still
+dispatch and respond correctly, and the checksum self-consistency check was
+rewritten to match DSP0222's own verification recipe (see below) rather
+than the coincidentally-matching 32-bit-word sum the old test used, which
+would not actually have caught a wrong checksum after this rewrite. This
+pass also caught an unrelated payload-length bug in `gVersionFrame`'s
+static initializer (`PayloadLength` was `44`, should be `40` given the
+corrected `VersionResponsePacket_t` field list) — a plain miscount, found
+by re-deriving the value from the rewritten struct rather than carrying the
+old one forward.
+
+## DSP0222 Checksum computation
+
+This port, like upstream, always sends the Checksum field as `0x00000000`
+— DSP0222's valid "not calculated" sentinel — by default. An optional real
+computation is available: `NCSI_SetComputeChecksum(true)` /
+`NCSI_GetComputeChecksum()` (`NCSI.h`), defaulting to
+`NCSI_COMPUTE_CHECKSUM_DEFAULT` in `ncsi_board_config.h` (**default
+`false`**).
+
+**Algorithm** (DSP0222 v1.2.1 clause 8.2.2.3, quoted from the actual spec
+text, not paraphrased): "the checksum compensation shall be computed as the
+2's complement of the checksum, which shall be computed as the 32-bit
+unsigned sum of the NC-SI packet header and NC-SI packet payload
+interpreted as a series of 16-bit unsigned integer values." Verification:
+"computing the 32-bit checksum described above, adding to it the checksum
+compensation value from the packet, and verifying that the result is 0."
+`ncsi_compute_checksum()` (`types.h`) implements exactly this: sum the
+region from `ManagmentControllerID` through the byte before the Checksum
+field as consecutive big-endian 16-bit words (a trailing odd byte
+zero-padded) into a 32-bit accumulator, then store the 2's complement.
+Note this is **not** the classic 16-bit-folded Internet checksum — the
+32-bit sum is never folded down to 16 bits, and verification adds the
+4-byte checksum field in as *one* 32-bit value, not two more 16-bit words —
+getting that distinction wrong is exactly the mistake `tests/test_ncsi.c`'s
+`verify_checksum()` comment calls out, since it's easy to write a
+self-check that looks reasonable but doesn't actually match this
+algorithm.
+
+Verified in `tests/test_ncsi.c`: self-consistency (DSP0222's own
+verification recipe above, applied to freshly computed checksums) across
+all four response struct types. Not yet verified against a real captured
+checksummed frame from an actual BMC exchange — worth doing before
+enabling this in production, per the usual "no real capture exists for
+this yet" caveat that applies to a few other fields in this port too.
+
 ## Known gaps
 
-- VLAN handling (Set/Enable/Disable VLAN) is a stub — accepts the command,
-  applies no actual filtering.
+- VLAN handling (Set/Enable/Disable VLAN) and Broadcast Filtering settings
+  are tracked (the commands' values are recorded in `NetworkPort_t::state`)
+  but not enforced against actual traffic — this port has no
+  packet-classification path in software; enforcing these against real
+  traffic is expected to happen in your MAC/PHY driver or hardware filter,
+  informed by the tracked state.
+- The optional Checksum computation (off by default) is verified for
+  self-consistency against DSP0222's own verification recipe (clause
+  8.2.2.3), not against a real captured checksummed frame from an actual
+  BMC exchange — see "DSP0222 Checksum computation" above.
 - Get Parameters (`0x17`) is DSP0222-**mandatory** but not implemented —
   the one gap here that shouldn't ship as-is. Needs its own response struct
   in `Ethernet.h` (not modeled yet) and a real DSP0222 copy to get the byte

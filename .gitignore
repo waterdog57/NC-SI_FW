@@ -45,3 +45,6 @@ cmake-build-*/
 *~
 .DS_Store
 Thumbs.db
+
+# doc
+*.pdf

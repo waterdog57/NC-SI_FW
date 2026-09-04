@@ -25,10 +25,9 @@
 ///     Summary" PHY register (0x19); here it reads the standard MII BMSR
 ///     (register 1) link-status bit, so it works with any IEEE 802.3 PHY.
 ///   - Removed BCM5719 PCI-config-space lookups in getVersionID() (a
-///     RISC-V32 NC-SI device is generally not a PCI function); the
-///     PCIVendor/PCIDevice/PCISubsystemVendor/PCISubsystemDevice fields
-///     come from ncsi_board_config.h instead (default: DSP0222's "not
-///     applicable" sentinel, 0xFFFF).
+///     RISC-V32 NC-SI device is generally not a PCI function); the PCI ID
+///     fields come from ncsi_board_config.h instead (default: DSP0222's
+///     "not used" sentinel, 0x0000 per clause 8.4.44.4).
 ///   - Removed APE_aquireLock()/APE_releaseLock() calls around PHY access
 ///     (that lock arbitrated APE-vs-main-chip access to shared MDIO
 ///     hardware on BCM5719; add your own locking inside MII_readRegister()
@@ -56,18 +55,48 @@
 ///     Confirmed with AddressSanitizer (global-buffer-overflow at the
 ///     `handler->fn` dereference) before the fix; see
 ///     tests/test_ncsi.c's "gNCSIHandlers[] out-of-bounds read" block.
+///   - Added optional DSP0222 Checksum computation (upstream always sends
+///     the 0/0 "not calculated" sentinel; NCSI_SetComputeChecksum()/
+///     NCSI_GetComputeChecksum(), default off -- see
+///     NCSI_COMPUTE_CHECKSUM_DEFAULT in ncsi_board_config.h). Wired into
+///     every response builder via NCSI_APPLY_CHECKSUM_IF_ENABLED() below;
+///     see ncsi_compute_checksum() in types.h for the DSP0222 clause 8.2.2.3
+///     algorithm this implements.
+///   - Ethernet.h's struct layouts were rewritten directly against the real
+///     DSP0222 v1.2.1 spec text (provided for this port) after it turned up
+///     three real bugs in the layout this port had inherited from upstream:
+///     the NC-SI header being 2 bytes short, spurious reserved gaps in
+///     response payloads, and Checksum being incorrectly split into two
+///     non-adjacent halves instead of one contiguous 4-byte field. See
+///     Ethernet.h's header comment for details. This rewrite also fixed the
+///     PCI-ID and Manufacturer-ID "unused" sentinel values (0x0000 and
+///     0xFFFFFFFF respectively per clauses 8.4.44.4/8.4.44.5 -- this port
+///     previously used 0xFFFF for both, which was wrong for the PCI IDs).
+///   - Added DSP0222 Pass-through support (clauses 6.1.11/6.1.12): tracks
+///     configured MAC address filters (Set MAC Address) so the
+///     BMC-to-network direction can check the DSP0222-mandated "source MAC
+///     matches a configured unicast filter" condition; see
+///     ncsi_passthrough_tx_from_mc() below and its caller in
+///     ncsi_hal_template.c. The network-to-BMC direction
+///     (NCSI_handlePassthrough() / Network_PassthroughRxPacket()) existed
+///     as scaffolding before this port; its gating condition was corrected
+///     to check state.enabled (clause 6.1.12: "after the channel has been
+///     enabled") rather than state.ready.
 ///
 /// Known gaps carried over from upstream (see project README before relying
 /// on this in production):
-///   - VLAN handling (Set/Enable/Disable VLAN) is a stub: it accepts the
-///     command but never actually filters by VLAN.
+///   - VLAN and broadcast/multicast filtering settings are tracked (Set
+///     VLAN Filter, Enable/Disable VLAN, Enable/Disable Broadcast Filter
+///     all record their configured values now) but not actually enforced
+///     against traffic -- this port has no packet-classification path in
+///     software; enforcing these is expected to happen in your MAC/PHY
+///     driver or hardware filter, informed by the tracked state.
 ///   - Get Parameters (0x17) is DSP0222-*mandatory* but not implemented
 ///     (unknownHandler() answers "unsupported") -- unlike the commands
-///     below, this one should not ship unimplemented. Needs its own
-///     response struct in Ethernet.h (not modeled yet) plus a real DSP0222
-///     copy to get the field layout right -- follow the same
-///     capture-verify approach used for the rest of this port (see
-///     Ethernet.h's header comment) rather than guessing the byte layout.
+///     below, this one should not ship unimplemented. Its response payload
+///     length varies with how many MAC/VLAN filters are supported (clause
+///     8.4.48), which is more involved than this port's fixed-size response
+///     structs support today.
 ///   - OEM Command (0x50) and the truly optional Get Controller Packet
 ///     Statistics / Get NC-SI Statistics / Get Pass-through Statistics /
 ///     Set NC-SI Flow Control / Enable-Disable Global Multicast Filtering
@@ -106,6 +135,38 @@
 static uint8_t gLocalPackageId;
 static uint8_t gLocalChannelId;
 
+/* Whether outgoing responses get a real Checksum computed -- see
+ * NCSI_SetComputeChecksum()/NCSI_GetComputeChecksum() (NCSI.h) and
+ * ncsi_compute_checksum() (types.h) for what this does and its caveats. */
+static bool gNcsiComputeChecksum = NCSI_COMPUTE_CHECKSUM_DEFAULT;
+
+void NCSI_SetComputeChecksum(bool enable)
+{
+    gNcsiComputeChecksum = enable;
+}
+
+bool NCSI_GetComputeChecksum(void)
+{
+    return gNcsiComputeChecksum;
+}
+
+/* Computes and writes obj's checksum[4] field if checksums are currently
+ * enabled; no-op otherwise (leaves the caller's existing 0/0/0/0 "not
+ * calculated" bytes in place). `structtype` must be one of the Ethernet.h
+ * response structs -- anything with ManagmentControllerID and checksum
+ * fields. */
+#define NCSI_APPLY_CHECKSUM_IF_ENABLED(structtype, obj)                                  \
+    do                                                                                   \
+    {                                                                                    \
+        if (gNcsiComputeChecksum)                                                        \
+        {                                                                                \
+            uint32_t region_start_ = offsetof(structtype, ManagmentControllerID);        \
+            uint32_t checksum_offset_ = offsetof(structtype, checksum);                  \
+            ncsi_compute_checksum((uint8_t *)&(obj), region_start_,                      \
+                                   checksum_offset_ - region_start_, checksum_offset_);   \
+        }                                                                                 \
+    } while (0)
+
 /* Response frame - global and usable by one thread at a time only. */
 NetworkFrame_t gResponseFrame =
 {
@@ -120,16 +181,12 @@ NetworkFrame_t gResponseFrame =
         .ControlPacketType = 0, /* Filled in by appropriate handler. */
         .InstanceID = 0,        /* Filled in by appropriate handler. */
         .reserved_0 = 0,
-        .reserved_2 = {0, 0},
+        .reserved_2 = {0, 0, 0, 0, 0, 0, 0, 0},
         .PayloadLength = {0, 4},
-        .reserved_3 = {0, 0, 0, 0},
 
         .ResponseCode = {0, 0}, /* Filled in by appropriate handler. */
-        .reserved_4 = {0, 0},
-        .reserved_5 = {0, 0},
         .ReasonCode = {0, 0},   /* Filled in by appropriate handler. */
-        .Checksum_High = {0, 0},
-        .Checksum_Low = {0, 0},
+        .checksum = {0, 0, 0, 0},
     },
 };
 
@@ -146,21 +203,15 @@ NetworkFrame_t gLinkStatusResponseFrame =
         .ControlPacketType = CONTROL_PACKET_TYPE_RESPONSE | CONTROL_PACKET_TYPE_GET_LINK_STATUS,
         .InstanceID = 0,        /* Filled in by appropriate handler. */
         .reserved_0 = 0,
-        .reserved_2 = {0, 0},
+        .reserved_2 = {0, 0, 0, 0, 0, 0, 0, 0},
         .PayloadLength = {0, 16},
 
         .ResponseCode = {0, NCSI_RESPONSE_CODE_COMMAND_COMPLETE},
-        .reserved_4 = {0, 0},
-        .LinkStatus_High = {0, 0},
         .ReasonCode = {0, NCSI_REASON_CODE_NONE},
-        .OtherIndications_High = {0, 0},
-        .LinkStatus_Low = {0, 0},
-        .OEMLinkStatus_High = {0, 0},
-        .OtherIndications_Low = {0, 0},
-        .OEMLinkStatus_Low = {0, 0},
-
-        .Checksum_High = {0, 0},
-        .Checksum_Low = {0, 0},
+        .LinkStatus = {0, 0, 0, 0},
+        .OtherIndications = {0, 0, 0, 0},
+        .OEMLinkStatus = {0, 0, 0, 0},
+        .checksum = {0, 0, 0, 0},
     },
 };
 
@@ -177,32 +228,24 @@ NetworkFrame_t gCapabilitiesFrame =
         .ControlPacketType = CONTROL_PACKET_TYPE_RESPONSE | CONTROL_PACKET_TYPE_GET_CAPABILITIES,
         .InstanceID = 0,        /* Filled in by appropriate handler. */
         .reserved_0 = 0,
-        .reserved_2 = {0, 0},
+        .reserved_2 = {0, 0, 0, 0, 0, 0, 0, 0},
         .PayloadLength = {0, 32},
 
         .ResponseCode = {0, NCSI_RESPONSE_CODE_COMMAND_COMPLETE},
-        .reserved_4 = {0, 0},
-
-        .Capabilities_High = {0, 0},
         .ReasonCode = {0, NCSI_REASON_CODE_NONE},
-        .BroadcastCapabilities_High = {0, 0},
-        .Capabilities_Low = {0, 0},
-        .MilticastCapabilities_High = {0, 0},
-        .BroadcastCapabilities_Low = {0, 0xF},
-        .BufferingCapabilities_High = {0, 0},
-        .MilticastCapabilities_Low = {0, 0x7},
-        .AENControlSupport_High = {0, 0},
-        .BufferingCapabilities_Low = {0, 0x7},
+        .CapabilitiesFlags = {0, 0, 0, 0},
+        .BroadcastPacketFilterCapabilities = {0, 0, 0, 0xF}, /* Table 73 bits 0-3: ARP/DHCP client/DHCP server/NetBIOS */
+        .MulticastPacketFilterCapabilities = {0, 0, 0, 0},
+        .BufferingCapability = {0, 0, 0, 0}, /* 0 = unspecified (clause 8.4.46.4) */
+        .AENControlSupport = {0, 0, 0, 0x7}, /* Table 42 bits 0-2: Link Status Change/Config Required/Host NC Driver Status Change */
         .VLANFilterCount = 1,
         .MixedFilterCount = 1,
-        .AENControlSupport_Low = {0, 0},
-        .ChannelCount = NCSI_PACKAGE_CHANNEL_COUNT, /* total channels in this *package* (both ICs), not NUM_CHANNELS (this chip's own count, always 1) */
-        .VLANModeSupport = 0x7,
         .MulticastFilterCount = 1,
         .UnicastFilterCount = 1,
-
-        .Checksum_High = {0, 0},
-        .Checksum_Low = {0, 0},
+        .reserved_1 = {0, 0},
+        .VLANModeSupport = 0x7, /* Table 91 bits 0-2: VLAN only / VLAN+non-VLAN / Any VLAN+non-VLAN */
+        .ChannelCount = NCSI_PACKAGE_CHANNEL_COUNT, /* total channels in this *package* (both ICs), not "how many this instance implements" (always 1) */
+        .checksum = {0, 0, 0, 0},
     },
 };
 
@@ -219,48 +262,44 @@ NetworkFrame_t gVersionFrame =
         .ControlPacketType = CONTROL_PACKET_TYPE_RESPONSE | CONTROL_PACKET_TYPE_GET_VERSION_ID,
         .InstanceID = 0,        /* Filled in by appropriate handler. */
         .reserved_0 = 0,
-        .reserved_2 = {0, 0},
-        .PayloadLength = {0, 40},
+        .reserved_2 = {0, 0, 0, 0, 0, 0, 0, 0},
+        .PayloadLength = {0, 40}, /* ResponseCode+ReasonCode(4) + Major/Minor/Update/Alpha1(4) + reserved_1(3) + Alpha2(1) + FirmwareNameString(12) + FirmwareVersion(4) + PCIDID/PCIVID/PCISSID/PCISVID(8) + ManufacturerID(4) = 40; checksum starts at byte 70 (30+40) */
 
         .ResponseCode = {0, NCSI_RESPONSE_CODE_COMMAND_COMPLETE},
         .ReasonCode = {0, NCSI_REASON_CODE_NONE},
 
-        /* NCSI Version -- DSP0222 revision this device implements. */
-        .NCSIMajor = 1,
-        .NCSIMinor = 2,
-        .NCSIUpdate = 0,
-        .NCSIAlpha1 = 0,
-        .NCSIAlpha2 = 0,
+        /* NC-SI Version (clause 8.4.44.1): BCD-encoded with an 0xF-prefixed
+         * MS nibble meaning "single digit value". DSP0222 v1.2.1 mandates
+         * reporting compatibility as "1.2.0" (0xF1F2F00000) regardless --
+         * this is a documentation-only spec revision, not a wire-format
+         * change, per the spec's own text. */
+        .NCSIMajor = 0xF1,
+        .NCSIMinor = 0xF2,
+        .NCSIUpdate = 0xF0,
+        .NCSIAlpha1 = 0x00,
+        .reserved_1 = {0, 0, 0},
+        .NCSIAlpha2 = 0x00,
 
-        /* Firmware Name (up to 12 ASCII chars, name_0 first) */
-        .name_11 = ' ',
-        .name_10 = ' ',
-        .name_9  = ' ',
-        .name_8  = ' ',
-        .name_7  = ' ',
-        .name_6  = ' ',
-        .name_5  = ' ',
-        .name_4  = ' ',
-        .name_3  = 'I',
-        .name_2  = 'S',
-        .name_1  = 'C',
-        .name_0  = 'N',
+        /* Firmware Name String: left-justified, most-significant byte
+         * (leftmost character) first (clause 8.4.44.2). */
+        .FirmwareNameString = {'N', 'C', 'S', 'I', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '},
 
-        /* Firmware Version */
-        .FWVersion_High = {NCSI_FW_VERSION_MAJOR, NCSI_FW_VERSION_MINOR},
-        .FWVersion_Low = {0, NCSI_FW_VERSION_PATCH},
+        .FirmwareVersion = {0, NCSI_FW_VERSION_MAJOR, NCSI_FW_VERSION_MINOR, NCSI_FW_VERSION_PATCH},
 
-        /* PCI identity -- see ncsi_board_config.h to override. */
-        .PCIVendor = {(uint8_t)(NCSI_PCI_VENDOR_ID >> 8), (uint8_t)NCSI_PCI_VENDOR_ID},
-        .PCIDevice = {(uint8_t)(NCSI_PCI_DEVICE_ID >> 8), (uint8_t)NCSI_PCI_DEVICE_ID},
-        .PCISubsystemVendor = {(uint8_t)(NCSI_PCI_SUBSYSTEM_VENDOR_ID >> 8), (uint8_t)NCSI_PCI_SUBSYSTEM_VENDOR_ID},
-        .PCISubsystemDevice = {(uint8_t)(NCSI_PCI_SUBSYSTEM_DEVICE_ID >> 8), (uint8_t)NCSI_PCI_SUBSYSTEM_DEVICE_ID},
+        /* PCI/Manufacturer identity -- see ncsi_board_config.h to override.
+         * "Not used" sentinels per clauses 8.4.44.4 (PCI IDs: 0x0000) and
+         * 8.4.44.5 (Manufacturer ID: 0xFFFFFFFF) -- these differ from each
+         * other, and this port previously used 0xFFFF for both, which was
+         * wrong for the PCI ID fields. */
+        .PCIDID = {(uint8_t)(NCSI_PCI_DEVICE_ID >> 8), (uint8_t)NCSI_PCI_DEVICE_ID},
+        .PCIVID = {(uint8_t)(NCSI_PCI_VENDOR_ID >> 8), (uint8_t)NCSI_PCI_VENDOR_ID},
+        .PCISSID = {(uint8_t)(NCSI_PCI_SUBSYSTEM_DEVICE_ID >> 8), (uint8_t)NCSI_PCI_SUBSYSTEM_DEVICE_ID},
+        .PCISVID = {(uint8_t)(NCSI_PCI_SUBSYSTEM_VENDOR_ID >> 8), (uint8_t)NCSI_PCI_SUBSYSTEM_VENDOR_ID},
 
-        .ManufacturerID_High = {(uint8_t)(NCSI_MANUFACTURER_ID >> 24), (uint8_t)(NCSI_MANUFACTURER_ID >> 16)},
-        .ManufacturerID_Low = {(uint8_t)(NCSI_MANUFACTURER_ID >> 8), (uint8_t)NCSI_MANUFACTURER_ID},
+        .ManufacturerID = {(uint8_t)(NCSI_MANUFACTURER_ID >> 24), (uint8_t)(NCSI_MANUFACTURER_ID >> 16),
+                            (uint8_t)(NCSI_MANUFACTURER_ID >> 8), (uint8_t)NCSI_MANUFACTURER_ID},
 
-        .Checksum_High = {0, 0},
-        .Checksum_Low = {0, 0},
+        .checksum = {0, 0, 0, 0},
     },
 };
 
@@ -324,7 +363,7 @@ static void clearInitialStateHandler(const NetworkFrame_t *frame)
 
 static void selectPackageHandler(const NetworkFrame_t *frame)
 {
-    NCSI_LOG("Package enabled. Arb: %d\n", frame->selectPackage.HardwareArbitartionDisabled ? 0 : 1);
+    NCSI_LOG("Package enabled. Arb: %d\n", frame->selectPackage.HardwareArbitartionDisabled & 0x01 ? 0 : 1);
     gPackageState.selected = true;
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
                      NCSI_RESPONSE_CODE_COMMAND_COMPLETE, NCSI_REASON_CODE_NONE);
@@ -355,9 +394,14 @@ static void enableChannelHandler(const NetworkFrame_t *frame)
 static void disableChannelHandler(const NetworkFrame_t *frame)
 {
     int ch = frame->controlPacket.ChannelID & CHANNEL_ID_MASK;
-    (void)ch; /* only used by NCSI_LOG below */
+    bool allow_link_down = (frame->disableChannel.ALD & 0x01) != 0;
+    (void)ch; (void)allow_link_down; /* only used by NCSI_LOG below; TODO: DSP0222 Table 33 -- if
+                             * ALD is set, this channel's external link may be taken down while
+                             * disabled (e.g. to save power) as long as no other functionality
+                             * (host OS, WoL) needs it; not acted on -- no HAL hook for "take the
+                             * link down" exists yet. */
 
-    NCSI_LOG("Disable Channel: %x\n", ch);
+    NCSI_LOG("Disable Channel: %x (ALD=%d)\n", ch, allow_link_down);
     gPackageState.port[0]->state.enabled = false;
 
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
@@ -399,8 +443,7 @@ static void disableChannelNetworkTXHandler(const NetworkFrame_t *frame)
 
 static void AENEnableHandler(const NetworkFrame_t *frame)
 {
-    uint32_t AENControl = ((uint32_t)ncsi_rd16(frame->AENEnable.AENControl_Low) |
-                            ((uint32_t)ncsi_rd16(frame->AENEnable.AENControl_High) << 16));
+    uint32_t AENControl = ncsi_rd32(frame->AENEnable.AENControl);
     NCSI_LOG("AEN Enable: AEN_MC_ID %x\n", frame->AENEnable.AEN_MC_ID);
     NCSI_LOG("AEN Enable: AENControl %x\n", AENControl);
 
@@ -413,10 +456,8 @@ static void AENEnableHandler(const NetworkFrame_t *frame)
 
 static void setLinkHandler(const NetworkFrame_t *frame)
 {
-    uint32_t LinkSettings = ((uint32_t)ncsi_rd16(frame->setLink.LinkSettings_Low) |
-                              ((uint32_t)ncsi_rd16(frame->setLink.LinkSettings_High) << 16));
-    uint32_t OEMLinkSettings = ((uint32_t)ncsi_rd16(frame->setLink.OEMLinkSettings_Low) |
-                                 ((uint32_t)ncsi_rd16(frame->setLink.OEMLinkSettings_High) << 16));
+    uint32_t LinkSettings = ncsi_rd32(frame->setLink.LinkSettings);
+    uint32_t OEMLinkSettings = ncsi_rd32(frame->setLink.OEMLinkSettings);
     NCSI_LOG("Set Link: LinkSettings %x\n", LinkSettings);
     NCSI_LOG("Set Link: OEMLinkSettings %x\n", OEMLinkSettings);
 
@@ -470,19 +511,19 @@ static void getLinkStatusHandler(const NetworkFrame_t *frame)
     port->state.link_status.autoneg_enabled = 1;
 
     /* WARNING -- placeholder Link Status encoding, not yet spec-complete.
-     * DSP0222's Get Link Status "Link Status" field is: bit 0 link flag,
-     * bits 3:1 a *3-bit* speed/duplex enumeration, bit 4 autoneg enable,
-     * bit 5 autoneg complete, bits 9:6 parallel detection, etc. This only
-     * sets a single bit (1) for "hcd" instead of the real 3-bit speed/duplex
-     * code, and does not report autoneg_complete at all (no HAL call
-     * surfaces it yet). Fill this in against the DSP0222 Get Link Status
-     * table -- e.g. have MII_readRegister()/your PHY driver resolve actual
+     * DSP0222 Table 51's "Link Status" field is: bit 0 link flag, bits 4:1
+     * a *4-bit* speed/duplex enumeration, bit 5 autoneg enable, bit 6
+     * autoneg complete, bit 7 parallel detection, etc. This only sets a
+     * single bit for "hcd" instead of the real 4-bit speed/duplex code,
+     * and does not report autoneg_complete or parallel detection at all
+     * (no HAL call surfaces them yet). Fill this in against Table 51 --
+     * e.g. have MII_readRegister()/your PHY driver resolve actual
      * negotiated speed/duplex and extend NetworkPort_t::state accordingly
      * -- before relying on BMC-side link/speed reporting. */
     uint32_t LinkStatus = port->state.link_status.link_up |
                            (port->state.link_status.autoneg_hcd << 1) |
-                           (port->state.link_status.autoneg_enabled << 4) |
-                           (port->state.link_status.autoneg_complete << 5);
+                           (port->state.link_status.autoneg_enabled << 5) |
+                           (port->state.link_status.autoneg_complete << 6);
     uint32_t OEMLinkStatus = 0;
     uint32_t OtherIndications = 0;
 
@@ -491,7 +532,7 @@ static void getLinkStatusHandler(const NetworkFrame_t *frame)
 
 static void disableVLANHandler(const NetworkFrame_t *frame)
 {
-    /* TODO: no VLAN filtering is actually applied -- see README gaps list. */
+    /* TODO: tracked, not enforced -- see ncsi.c's top-of-file comment. */
     int ch = frame->controlPacket.ChannelID & CHANNEL_ID_MASK;
     (void)ch; /* only used by NCSI_LOG below */
     NetworkPort_t *port = gPackageState.port[0];
@@ -516,6 +557,7 @@ static void getCapabilities(const NetworkFrame_t *frame)
     ncsi_wr16(gCapabilitiesFrame.capabilities.ResponseCode, NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
     ncsi_wr16(gCapabilitiesFrame.capabilities.ReasonCode, NCSI_REASON_CODE_NONE);
 
+    NCSI_APPLY_CHECKSUM_IF_ENABLED(CapabilitiesResponsePacket_t, gCapabilitiesFrame.capabilities);
     NCSI_TxPacket((const uint8_t *)&gCapabilitiesFrame, packetSize);
 }
 
@@ -531,18 +573,20 @@ static void getVersionID(const NetworkFrame_t *frame)
     ncsi_wr16(gVersionFrame.version.ResponseCode, NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
     ncsi_wr16(gVersionFrame.version.ReasonCode, NCSI_REASON_CODE_NONE);
 
+    NCSI_APPLY_CHECKSUM_IF_ENABLED(VersionResponsePacket_t, gVersionFrame.version);
     NCSI_TxPacket((const uint8_t *)&gVersionFrame, packetSize);
 }
 
 static void enableVLANHandler(const NetworkFrame_t *frame)
 {
-    /* TODO: no VLAN filtering is actually applied -- see README gaps list. */
+    /* TODO: tracked, not enforced -- see ncsi.c's top-of-file comment. */
     int ch = frame->controlPacket.ChannelID & CHANNEL_ID_MASK;
     (void)ch; /* only used by NCSI_LOG below */
+    uint8_t mode = frame->enableVLAN.Mode; /* Table 62: 0x01 VLAN only, 0x02 VLAN+non-VLAN, 0x03 Any VLAN+non-VLAN */
     NetworkPort_t *port = gPackageState.port[0];
-    port->state.vlan_enabled = false;
+    port->state.vlan_enabled = (mode != 0);
 
-    NCSI_LOG("Enable VLAN: channel %x\n", ch);
+    NCSI_LOG("Enable VLAN: channel %x mode %x\n", ch, mode);
 
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
                      NCSI_RESPONSE_CODE_COMMAND_COMPLETE, NCSI_REASON_CODE_NONE);
@@ -550,13 +594,23 @@ static void enableVLANHandler(const NetworkFrame_t *frame)
 
 static void setVLANFilter(const NetworkFrame_t *frame)
 {
-    /* TODO: no VLAN filtering is actually applied -- see README gaps list. */
+    /* TODO: tracked, not enforced -- see ncsi.c's top-of-file comment. */
     int ch = frame->controlPacket.ChannelID & CHANNEL_ID_MASK;
     (void)ch; /* only used by NCSI_LOG below */
-    NetworkPort_t *port = gPackageState.port[0];
-    port->state.vlan_enabled = false;
+    uint16_t vlan_id = ncsi_rd16(frame->setVLANFilter.VLANID) & 0x0FFFu;
+    uint8_t filter_selector = frame->setVLANFilter.FilterSelector;
+    (void)filter_selector; /* only used by NCSI_LOG below */
+    bool enable = (frame->setVLANFilter.Enable & 0x01) != 0;
 
-    NCSI_LOG("Set VLAN Filter: channel %x\n", ch);
+    NCSI_LOG("Set VLAN Filter: channel %x filter %u vlan %u enable %d\n", ch, filter_selector, vlan_id, enable);
+
+    /* Table 60: VLAN ID 0 is invalid when enabling a filter. */
+    if (enable && vlan_id == 0)
+    {
+        sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
+                         NCSI_RESPONSE_CODE_COMMAND_FAILED, 0x0B07 /* VLAN Tag Is Invalid */);
+        return;
+    }
 
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
                      NCSI_RESPONSE_CODE_COMMAND_COMPLETE, NCSI_REASON_CODE_NONE);
@@ -569,20 +623,15 @@ static void setMACAddressHandler(const NetworkFrame_t *frame)
     (void)ch; /* only used by NCSI_LOG below */
     NetworkPort_t *port = gPackageState.port[0];
 
-    uint16_t mac54 = ncsi_rd16(frame->setMACAddr.MAC54);
-    uint16_t mac32 = ncsi_rd16(frame->setMACAddr.MAC32);
-    uint16_t mac10 = ncsi_rd16(frame->setMACAddr.MAC10);
+    const uint8_t *mac = frame->setMACAddr.MACAddress; /* wire order: mac[0]=byte5 (MSB) .. mac[5]=byte0 (LSB) */
     uint8_t enable = SETMAC_ENABLE(frame->setMACAddr.MACInfo);
     uint8_t at = SETMAC_AT(frame->setMACAddr.MACInfo);
-    (void)at; /* only used by NCSI_LOG below; TODO: handle AT (address type) */
 
     NCSI_LOG("Set MAC: channel %x\n", ch);
-    NCSI_LOG("  MAC: 0x%04x%04x%04x\n", mac54, mac32, mac10);
+    NCSI_LOG("  MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     NCSI_LOG("  Enable: %d\n", enable);
     NCSI_LOG("  AT: %d\n", at);
     NCSI_LOG("  MACNumber: %d\n", frame->setMACAddr.MACNumber);
-
-    /* TODO: Handle AT (address type: unicast/multicast). */
 
     /* NC-SI has the mac starting at 1, reindex based at 0. */
     if (MACNumber > 0)
@@ -590,8 +639,27 @@ static void setMACAddressHandler(const NetworkFrame_t *frame)
         MACNumber--;
     }
 
-    uint32_t low = ((uint32_t)mac32 << 16) | mac10;
-    Network_SetMACAddr(port, mac54, low, MACNumber, enable ? true : false);
+    uint16_t mac_high16 = ((uint16_t)mac[0] << 8) | mac[1];
+    uint32_t mac_low32 = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
+    Network_SetMACAddr(port, mac_high16, mac_low32, MACNumber, enable ? true : false);
+
+    /* Track the filter locally too (see ncsi_passthrough.c) so the
+     * BMC-to-network Pass-through direction can check the DSP0222-mandated
+     * "source MAC matches a configured unicast filter" condition without
+     * round-tripping through the MAC driver. */
+    if (MACNumber < NCSI_MAX_MAC_FILTERS)
+    {
+        port->state.mac_filters[MACNumber].enabled = (enable != 0);
+        port->state.mac_filters[MACNumber].address_type = at;
+        for (int i = 0; i < 6; i++)
+        {
+            port->state.mac_filters[MACNumber].mac[i] = mac[i];
+        }
+    }
+    else
+    {
+        NCSI_LOG("Set MAC: filter slot %u out of range (max %u)\n", MACNumber, (unsigned)NCSI_MAX_MAC_FILTERS);
+    }
 
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
                      NCSI_RESPONSE_CODE_COMMAND_COMPLETE, NCSI_REASON_CODE_NONE);
@@ -599,10 +667,13 @@ static void setMACAddressHandler(const NetworkFrame_t *frame)
 
 static void enableBroadcastFilteringHandler(const NetworkFrame_t *frame)
 {
-    /* TODO: no broadcast filtering is actually applied. */
+    /* TODO: tracked, not enforced -- see ncsi.c's top-of-file comment. */
     int ch = frame->controlPacket.ChannelID & CHANNEL_ID_MASK;
     (void)ch; /* only used by NCSI_LOG below */
-    NCSI_LOG("Enable Broadcast Filtering: channel %x\n", ch);
+    NetworkPort_t *port = gPackageState.port[0];
+    port->state.broadcast_filter_settings = ncsi_rd32(frame->enableBroadcastFilter.BroadcastPacketFilterSettings);
+
+    NCSI_LOG("Enable Broadcast Filtering: channel %x settings %x\n", ch, port->state.broadcast_filter_settings);
 
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
                      NCSI_RESPONSE_CODE_COMMAND_COMPLETE, NCSI_REASON_CODE_NONE);
@@ -610,9 +681,11 @@ static void enableBroadcastFilteringHandler(const NetworkFrame_t *frame)
 
 static void disableBroadcastFilteringHandler(const NetworkFrame_t *frame)
 {
-    /* TODO: no broadcast filtering is actually applied. */
     int ch = frame->controlPacket.ChannelID & CHANNEL_ID_MASK;
     (void)ch; /* only used by NCSI_LOG below */
+    NetworkPort_t *port = gPackageState.port[0];
+    port->state.broadcast_filter_settings = 0; /* clause 8.4.35: reception of all broadcast frames re-enabled */
+
     NCSI_LOG("Disable Broadcast Filtering: channel %x\n", ch);
 
     sendNCSIResponse(frame->controlPacket.InstanceID, frame->controlPacket.ChannelID, frame->controlPacket.ControlPacketType,
@@ -757,6 +830,11 @@ void resetChannel(void)
     port->state.enabled = false;
     port->state.tx_passthrough_en = false;
     port->state.vlan_enabled = false;
+    port->state.broadcast_filter_settings = 0;
+    for (unsigned int i = 0; i < NCSI_MAX_MAC_FILTERS; i++)
+    {
+        port->state.mac_filters[i].enabled = false;
+    }
     port->state.stat_ncsi_rx = 0;
     port->state.stat_ncsi_tx = 0;
     port->state.stat_net_rx = 0;
@@ -851,13 +929,11 @@ void sendNCSILinkStatusResponse(uint8_t InstanceID, uint8_t channelID, uint32_t 
     ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.ResponseCode, NCSI_RESPONSE_CODE_COMMAND_COMPLETE);
     ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.ReasonCode, NCSI_REASON_CODE_NONE);
 
-    ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.LinkStatus_High, (uint16_t)(LinkStatus >> 16));
-    ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.LinkStatus_Low, (uint16_t)(LinkStatus & 0xffff));
-    ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.OEMLinkStatus_High, (uint16_t)(OEMLinkStatus >> 16));
-    ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.OEMLinkStatus_Low, (uint16_t)(OEMLinkStatus & 0xffff));
-    ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.OtherIndications_High, (uint16_t)(OtherIndications >> 16));
-    ncsi_wr16(gLinkStatusResponseFrame.linkStatusResponse.OtherIndications_Low, (uint16_t)(OtherIndications & 0xffff));
+    ncsi_wr32(gLinkStatusResponseFrame.linkStatusResponse.LinkStatus, LinkStatus);
+    ncsi_wr32(gLinkStatusResponseFrame.linkStatusResponse.OEMLinkStatus, OEMLinkStatus);
+    ncsi_wr32(gLinkStatusResponseFrame.linkStatusResponse.OtherIndications, OtherIndications);
 
+    NCSI_APPLY_CHECKSUM_IF_ENABLED(LinkStatusResponsePacketHeader_t, gLinkStatusResponseFrame.linkStatusResponse);
     NCSI_TxPacket((const uint8_t *)&gLinkStatusResponseFrame, packetSize);
 }
 
@@ -872,6 +948,7 @@ void sendNCSIResponse(uint8_t InstanceID, uint8_t channelID, uint16_t controlID,
     ncsi_wr16(gResponseFrame.responsePacket.ResponseCode, response_code);
     ncsi_wr16(gResponseFrame.responsePacket.ReasonCode, reasons_code);
 
+    NCSI_APPLY_CHECKSUM_IF_ENABLED(ResponsePacketHeader_t, gResponseFrame.responsePacket);
     NCSI_TxPacket((const uint8_t *)&gResponseFrame, packetSize);
 }
 
@@ -890,13 +967,23 @@ void NCSI_reload(reload_type_t reset_phy)
     reloadChannel(reset_phy);
 }
 
+/* --- Pass-through (DSP0222 clauses 6.1.11 / 6.1.12) ----------------------
+ * Two independent directions; see each function's comment. */
+
 void NCSI_handlePassthrough(void)
 {
+    /* Network-to-BMC direction (clause 6.1.12): "after the channel has
+     * been enabled, any packet that the Network Controller receives for
+     * the Management Controller shall be forwarded to the Management
+     * Controller." Gates on state.enabled (Enable Channel received), not
+     * just state.ready (Clear Initial State received) -- these are
+     * different DSP0222 states and the spec text for this clause
+     * specifically says "enabled". */
     for (unsigned int ch = 0; ch < ARRAY_ELEMENTS(gPackageState.port); ch++)
     {
         NetworkPort_t *port = gPackageState.port[ch];
 
-        if (port && port->state.ready)
+        if (port && port->state.enabled)
         {
             if (!Network_PassthroughRxPacket(port))
             {
@@ -904,4 +991,60 @@ void NCSI_handlePassthrough(void)
             }
         }
     }
+}
+
+bool ncsi_passthrough_tx_from_mc(NetworkPort_t *port, const uint8_t source_mac[6], const uint8_t *frame, uint32_t frame_len)
+{
+    /* BMC-to-network direction (clause 6.1.11): "Packets not recognized as
+     * command packets ... that are received on the Network Controller's
+     * NC-SI interface shall be assumed to be Pass-through packets provided
+     * that the source MAC Address matches one of the unicast MAC addresses
+     * settings (as configured by the Set MAC Address command) ..., and
+     * will be forwarded for transmission to the corresponding external
+     * network interface if Channel Network TX is enabled." Called from
+     * ncsi_on_rx_frame() (ncsi_hal_template.c) for any received frame that
+     * isn't an NC-SI control frame. Returns false (frame not forwarded,
+     * silently dropped per spec -- Pass-through packets never get an NC-SI
+     * response either way) if TX passthrough is disabled or the source MAC
+     * doesn't match an enabled unicast filter. */
+    if (!port || !port->state.tx_passthrough_en)
+    {
+        return false;
+    }
+
+    bool source_matches = false;
+    for (unsigned int i = 0; i < NCSI_MAX_MAC_FILTERS; i++)
+    {
+        const ncsi_mac_filter_t *filter = &port->state.mac_filters[i];
+        if (!filter->enabled || filter->address_type != 0 /* AT: 0 = unicast (Table 68) */)
+        {
+            continue;
+        }
+        bool match = true;
+        for (int b = 0; b < 6; b++)
+        {
+            if (filter->mac[b] != source_mac[b])
+            {
+                match = false;
+                break;
+            }
+        }
+        if (match)
+        {
+            source_matches = true;
+            break;
+        }
+    }
+
+    if (!source_matches)
+    {
+        return false;
+    }
+
+    bool ok = Network_TxFrame(port, frame, frame_len);
+    if (ok)
+    {
+        port->state.stat_net_tx++;
+    }
+    return ok;
 }
