@@ -1,0 +1,47 @@
+# AI-assistant session content -- not part of the shipped firmware/docs,
+# kept locally for continuity across sessions but not meant to be public.
+CLAUDE.md
+.claude/
+
+# --- C build artifacts ---
+*.o
+*.obj
+*.a
+*.la
+*.lo
+*.so
+*.so.*
+*.dylib
+*.dll
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.out
+*.exe
+*.gch
+*.pch
+*.d
+
+# Debug/symbol files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# This repo's own documented host-test build output (README.md "Build & verify")
+test_ncsi
+
+# Out-of-tree build directories, if you use one
+build/
+cmake-build-*/
+
+# --- Editor/OS cruft ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
